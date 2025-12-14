@@ -1,7 +1,6 @@
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, render_template, redirect
 from flask_cors import CORS
 from pymongo import MongoClient
-from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import google.generativeai as genai
 import numpy as np
@@ -11,24 +10,23 @@ from flask_socketio import SocketIO
 import threading
 import time
 
-# ---------- Flask + CORS ----------
+# ---------- Flask + CORS Setup ----------
 
+# WE TELL FLASK TO LOOK UP ONE FOLDER (../frontend) FOR TEMPLATES
 app = Flask(__name__)
-app.secret_key = "change-this-to-a-random-secret"
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+CORS(app, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*")
+app.secret_key = "premierlux_secret_key"
 
 # ---------- Gemini setup ----------
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-print("GEMINI_API_KEY in Flask:", GEMINI_API_KEY)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 else:
     print("Gemini API key not set! Some AI routes will fail.")
 
 # ---------- MongoDB setup ----------
-
 MONGO_URI = "mongodb+srv://dbirolliverhernandez_db_user:yqHWCWJwNxKofjHs@cluster0.bgmzgav.mongodb.net/?appName=Cluster0"
 client = MongoClient(MONGO_URI)
 db = client["premierlux"]
@@ -39,41 +37,48 @@ branches_collection = db["branches"]
 batches_collection = db["batches"]
 consumption_collection = db["consumption"]
 suppliers_collection = db["suppliers"]
-# ---------- Simple auth (demo only) ----------
-USERS = {
-    "admin@example.com": {
-        "password_hash": generate_password_hash("admin123"),
-        "role": "admin",
-        "name": "Admin User",
+logs_collection = db["logs"]
+alert_ack_collection = db["alert_acknowledgements"]
+# ---------- NEW add code----------
+def add_log(action, details=None):
+    """
+    Store a staff/admin activity log.
+
+    action  : short label, e.g. 'login', 'logout', 'adjust_stock'
+    details : optional dict with extra info about what they did
+    """
+    user_email = session.get("user_email", "unknown")
+    role = session.get("role", "unknown")
+
+    log_doc = {
+      "user_email": user_email,
+      "role": role,
+      "action": action,
+      "details": details or {},
+      "timestamp": datetime.now(timezone.utc).isoformat()
     }
-}
+    logs_collection.insert_one(log_doc)
+    # ---------- NEW add code----------
 
-@app.post("/api/login")
-def api_login():
-    data = request.json or {}
-    email = (data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
+# ---------- PAGE ROUTES (Serving HTML) ----------
 
-    user = USERS.get(email)
-    if not user or not check_password_hash(user["password_hash"], password):
-        return jsonify({"error": "Invalid email or password"}), 401
+# 1. Login Page
+@app.route("/login")
+def login_page():
+    # If user is already logged in, send them to dashboard
+    if "user_email" in session:
+        return redirect("/")
+    return render_template("login.html")
 
-    session["user_email"] = email
-    session["user_role"] = user["role"]
-    session["user_name"] = user["name"]
-
-    return jsonify({"message": "ok"}), 200
-
-@app.post("/api/logout")
-def api_logout():
-    session.clear()
-    return jsonify({"message": "logged_out"}), 200
-
-# ---------- Root ----------
-
+# 2. Protected Dashboard (Home)
 @app.route("/")
 def home():
-    return "Flask backend is running!"
+    # If NOT logged in, kick them to login page
+    if "user_email" not in session:
+        return redirect("/login")
+    
+    # If logged in, show the dashboard
+    return render_template("index.html")
 
 # ---------- INVENTORY CRUD + QUERIES ----------
 
@@ -107,8 +112,8 @@ def get_low_stock():
         )
     )
     return jsonify(items)
-
-@app.route("/api/inventory/<name>/adjust", methods=["POST"])
+# ---------- NEW add code----------
+@app.route("/api/inventory/<string:name>/adjust", methods=["POST"])
 def adjust_inventory(name):
     data = request.json or {}
     branch = data.get("branch")
@@ -126,28 +131,46 @@ def adjust_inventory(name):
         return jsonify({"error": "item not found"}), 404
 
     new_qty = max(0, int(inv.get("quantity", 0)) + delta)
+
     inventory_collection.update_one(
         {"_id": inv["_id"]},
-        {"$set": {"quantity": new_qty}},
+        {"$set": {"quantity": new_qty}}
     )
 
-    # log this change as a movement event for analytics
     consumption_collection.insert_one({
         "name": name,
-        "date": datetime.utcnow(),
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
         "quantity_used": abs(delta),
         "direction": "out" if delta < 0 else "in",
         "branch": branch or inv.get("branch"),
     })
 
+    # Log this action
+    add_log("adjust_stock", {
+        "item": name,
+        "branch": branch or inv.get("branch"),
+        "delta": delta,
+        "new_quantity": new_qty,
+    })
+
     return jsonify({"status": "ok", "quantity": new_qty})
+# ---------- NEW add code----------
 
 # ---------- BATCHES ----------
+@app.route("/api/batches", methods=["GET"])
+def get_batches():
+    # Fetch all fields. Convert _id to string for JSON compatibility.
+    batches = list(batches_collection.find({}))
+    for b in batches:
+        b['_id'] = str(b['_id']) # Convert ObjectId to string
+    return jsonify(batches), 200
 
+# 2. This one already exists in your file (Keep it!)
+
+# ---------- NEW add code----------
 @app.route("/api/batches", methods=["POST"])
 def create_batch():
     data = request.get_json(force=True)
-
     if not data or "item_name" not in data or "branch" not in data:
         return jsonify({"error": "item_name and branch are required"}), 400
 
@@ -165,12 +188,13 @@ def create_batch():
         "exp_date": data.get("exp_date") or None,
         "supplier_batch": data.get("supplier_batch") or None,
         "qr_code_id": data.get("qr_code_id") or None,
+        "category": data.get("category") or "Uncategorized",
     }
 
     result = batches_collection.insert_one(batch_doc)
-    batch_doc["_id"] = str(result.inserted_id)
+    batch_doc["id"] = str(result.inserted_id)
 
-    # update inventory totals for this item + branch
+    # Upsert inventory summary for this item+branch
     inventory_collection.update_one(
         {"name": batch_doc["item_name"], "branch": batch_doc["branch"]},
         {
@@ -178,14 +202,46 @@ def create_batch():
                 "reorder_level": batch_doc["reorder_level"],
                 "price": batch_doc["price"],
             },
+            "$set": {"category": batch_doc["category"]},
             "$inc": {"quantity": batch_doc["current_stock"]},
         },
         upsert=True,
     )
 
+    # Log batch creation
+    add_log("add_batch", {
+        "item": batch_doc["item_name"],
+        "branch": batch_doc["branch"],
+        "quantity": batch_doc.get("current_stock", 0),
+    })
+
     return jsonify({"status": "ok", "batch": batch_doc}), 201
+# ---------- NEW add code----------
 
 # ---------- AI: SIMPLE FORECASTING ----------
+@app.route("/api/logs", methods=["GET"])
+def get_logs():
+    """
+    Return recent activity logs.
+    Only admin should see this table.
+    """
+    if session.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
+    limit = int(request.args.get("limit", 100))
+    user_filter = request.args.get("user")
+
+    query = {}
+    if user_filter:
+        query["user_email"] = user_filter
+
+    cursor = logs_collection.find(query).sort("timestamp", -1).limit(limit)
+    logs = []
+    for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        logs.append(doc)
+
+    return jsonify(logs), 200
 
 @app.route("/api/forecast/<item_name>", methods=["GET"])
 def forecast_item(item_name):
@@ -412,6 +468,7 @@ def get_suppliers():
     suppliers = list(suppliers_collection.find({}, {"_id": 0}))
     return jsonify(suppliers), 200
 
+
 @app.route("/api/suppliers", methods=["POST"])
 def add_supplier():
     data = request.json or {}
@@ -421,6 +478,7 @@ def add_supplier():
     doc = {
         "name": data["name"],
         "contact": data.get("contact", ""),
+        "phone": data.get("phone", ""),  # <--- ADD THIS LINE
         "lead_time_days": data.get("lead_time_days", 0),
     }
     suppliers_collection.insert_one(doc)
@@ -622,12 +680,52 @@ def analytics_movement():
         "low_stock": low_stock,
     })
 
+@app.get("/analytics/movement-monthly")
+def analytics_movement_monthly():
+    now = datetime.now()
+    months = []
+    for i in range(11, -1, -1):
+        first = (now.replace(day=1) - timedelta(days=30 * i))
+        months.append((first.year, first.month))
+
+    month_labels = [datetime(y, m, 1).strftime("%b %Y") for (y, m) in months]
+    month_in = [0] * 12
+    month_out = [0] * 12
+
+    oldest_year, oldest_month = months[0]
+    since = datetime(oldest_year, oldest_month, 1)
+
+    usage = list(consumption_collection.find({"date": {"$gte": since}}))
+    for u in usage:
+        d = u.get("date")
+        if isinstance(d, str):
+            d = datetime.fromisoformat(d)
+        ym = (d.year, d.month)
+        if ym not in months:
+            continue
+        idx = months.index(ym)
+        qty = u.get("quantity_used", 1)
+        if u.get("direction") == "in":
+            month_in[idx] += qty
+        else:
+            month_out[idx] += qty
+
+    return jsonify({
+        "labels": month_labels,
+        "stock_in": month_in,
+        "stock_out": month_out,
+    })
+
+
 @app.get("/analytics/category")
 def analytics_category():
-    return jsonify(list(inventory_collection.aggregate([
+    pipeline = [
         {"$match": {"category": {"$ne": None}}},
         {"$group": {"_id": "$category", "total": {"$sum": "$quantity"}}},
-    ])))
+        {"$project": {"_id": 0, "id": "$_id", "total": 1}},
+    ]
+    return jsonify(list(inventory_collection.aggregate(pipeline)))
+
 
 @app.get("/analytics/low-stock")
 def analytics_low_stock():
@@ -661,7 +759,6 @@ def analytics_branch_stock():
 # ---------- SOCKET ANALYTICS BROADCASTER ----------
 
 def build_analytics_payload():
-    # ---------- Overview ----------
     new_items = inventory_collection.count_documents({
         "created_at": {"$gte": datetime.now() - timedelta(days=7)}
     })
@@ -678,14 +775,12 @@ def build_analytics_payload():
         "branches": branches,
     }
 
-    # ---------- WEEKLY movement (for small bar chart) ----------
     today = datetime.now()
     start_week = today - timedelta(days=6)
     week_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     week_in = [0] * 7
     week_out = [0] * 7
 
-    # stock in from batches (last 7 days)
     batches = list(batches_collection.find({"mfg_date": {"$gte": start_week}}))
     for b in batches:
         d = b.get("mfg_date")
@@ -696,7 +791,6 @@ def build_analytics_payload():
         day = d.weekday()  # 0=Mon..6=Sun
         week_in[day] += b.get("current_stock", b.get("quantity", 0) or 0)
 
-    # stock in/out from consumption (last 7 days)
     usage = list(consumption_collection.find({"date": {"$gte": start_week}}))
     for u in usage:
         d = u.get("date")
@@ -717,7 +811,6 @@ def build_analytics_payload():
         "stock_out": week_out,
     }
 
-    # ---------- MONTHLY movement (for big line chart, last 12 months) ----------
     now = datetime.now()
     months = []
     for i in range(11, -1, -1):
@@ -734,7 +827,6 @@ def build_analytics_payload():
     oldest_year, oldest_month = months[0]
     since = datetime(oldest_year, oldest_month, 1)
 
-    # use the same movements but aggregated per month
     usage_all = list(consumption_collection.find({"date": {"$gte": since}}))
     for u in usage_all:
         d = u.get("date")
@@ -756,7 +848,6 @@ def build_analytics_payload():
         "stock_out": month_out,
     }
 
-    # ---------- Low stock table & top products ----------
     low_stock_rows = list(inventory_collection.find(
         {"$expr": {"$lte": ["$quantity", "$reorder_level"]}},
         {"_id": 0, "name": 1, "quantity": 1},
@@ -770,8 +861,8 @@ def build_analytics_payload():
 
     return {
         "overview": overview,
-        "movement": weekly_movement,          # weekly for small chart
-        "movement_monthly": monthly_movement, # monthly for big chart
+        "movement": weekly_movement,
+        "movement_monthly": monthly_movement,
         "low_stock": low_stock_rows,
         "top_products": top_products,
     }
@@ -781,7 +872,6 @@ def analytics_broadcaster():
     while True:
         try:
             payload = build_analytics_payload()
-            print("SOCKET ANALYTICS PAYLOAD:", payload)
             socketio.emit("analytics_update", payload, namespace="/analytics")
         except Exception as e:
             print("Analytics broadcaster error:", e)
@@ -792,6 +882,59 @@ def analytics_broadcaster():
 def analytics_connect():
     print("Client connected to analytics")
 
+
+@app.route("/debug/batch", methods=["POST"])
+def debug_batch():
+    data = request.get_json(force=True)
+    try:
+        batch_doc = {
+            "item_name": data.get("item_name"),
+            "branch": data.get("branch"),
+            "current_stock": data.get("current_stock", 0),
+            "category": data.get("category") or "Uncategorized",
+        }
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+    # ---------- AUTHENTICATION APIs (Missing!) ----------
+
+# Required for sessions to work!
+app.secret_key = "super_secret_key_change_this_in_production" 
+
+# ---------- NEW add code----------
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.json or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    # Admin User
+    if email == "admin@example.com" and password == "admin123":
+        session["user_email"] = email
+        session["role"] = "admin"
+        add_log("login", {"note": "admin login"})
+        return jsonify({"message": "Login successful"}), 200
+
+    # Staff User
+    if email == "staff@example.com" and password == "staff123":
+        session["user_email"] = email
+        session["role"] = "staff"
+        add_log("login", {"note": "staff login"})
+        return jsonify({"message": "Login successful"}), 200
+
+    return jsonify({"error": "Invalid credentials"}), 401
+
+# ---------- NEW add code----------
+
+# ---------- NEW add code----------
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    add_log("logout")
+    session.clear()
+    return jsonify({"message": "Logged out"}), 200
+
+# ---------- NEW add code----------
 
 # ---------- Run server ----------
 
